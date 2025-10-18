@@ -1,67 +1,41 @@
 # app.py
-# A simple personal finance management "game" built with Streamlit.
+# A personal finance "game" for managing credit card debt.
 # To run:
 # 1. Save this file as app.py
 # 2. Make sure you have streamlit and pandas:
-#    pip install streamlit pandas
+#    pip install streamlit pandas altair
 # 3. In your terminal, run:
 #    streamlit run app.py
 
 import streamlit as st
 import pandas as pd
+import altair as alt
 import os
-import altair as alt # Used for more flexible charting
 
 # --- Constants ---
-HISTORY_FILE = "finance_history.csv"
-ACCOUNTS = ["Savings", "Kotak", "IDFC", "Supermoney"]
-DEBT_ACCOUNTS = ["Kotak", "IDFC", "Supermoney"]
+HISTORY_FILE = "cc_game_history.csv"
+CC_ACCOUNTS = ["Kotak", "IDFC", "Super"]
+ALL_ACCOUNTS = ["Savings"] + CC_ACCOUNTS
 
 # --- Utility Functions ---
 
-def get_color_from_value(value, high_is_bad=True, medium_threshold=5000, high_threshold=15000):
-    """Returns a color based on a value and thresholds."""
-    if high_is_bad:
-        if value > high_threshold:
-            return "red"
-        elif value > medium_threshold:
-            return "orange"
-        else:
-            return "green"
-    else: # Low is bad (e.g., Savings)
-        if value < medium_threshold:
-            return "red"
-        elif value < high_threshold:
-            return "orange"
-        else:
-            return "green"
+def get_utilization_color(usage_pct):
+    """Returns a color based on credit utilization percentage."""
+    if usage_pct > 80:
+        return "red"
+    elif usage_pct > 50:
+        return "orange"
+    else:
+        return "green"
 
-def display_account_card(col, name, balance, hp, is_debt=False):
-    """Renders a single account's info card in a Streamlit column."""
-    
-    # Get settings from session state
-    medium_threshold = st.session_state.get('debt_medium', 5000)
-    high_threshold = st.session_state.get('debt_high', 15000)
-
-    if is_debt:
-        label = f"💳 {name} (Debt)"
-        color = get_color_from_value(balance, high_is_bad=True, medium_threshold=medium_threshold, high_threshold=high_threshold)
-        delta_color = "inverse" if balance > 0 else "off"
-        st.metric(label=label, value=f"₹{balance:,.2f}", delta=f"{hp} HP", delta_color=delta_color)
-    else: # Savings Account
-        label = f"💰 {name}"
-        # For savings, low balance is bad
-        color = get_color_from_value(balance, high_is_bad=False, medium_threshold=medium_threshold, high_threshold=high_threshold)
-        delta_color = "normal" if balance > high_threshold else "inverse"
-        st.metric(label=label, value=f"₹{balance:,.2f}", delta=f"{hp} HP", delta_color=delta_color)
-
-    # Custom colored progress bar
-    st.markdown(f"""
-    <div style="background: #f0f2f6; border-radius: 5px; height: 10px; margin-top: 5px;">
-        <div style="width: {hp}%; background-color: {color}; height: 10px; border-radius: 5px;"></div>
-    </div>
-    """, unsafe_allow_html=True)
-
+def get_hp_color(hp):
+    """Returns a color for HP."""
+    if hp < 30:
+        return "red"
+    elif hp < 70:
+        return "orange"
+    else:
+        return "green"
 
 def load_data():
     """Loads history from CSV or returns a new DataFrame."""
@@ -77,10 +51,12 @@ def create_empty_history_df():
     """Creates the structure for the history DataFrame."""
     columns = [
         "Month",
-        "Savings_Balance", "Kotak_Debt", "IDFC_Debt", "Supermoney_Debt",
-        "Savings_HP", "Kotak_HP", "IDFC_HP", "Supermoney_HP",
+        "Savings_Balance", "Savings_HP",
+        "Kotak_Debt", "Kotak_Due", "Kotak_HP",
+        "IDFC_Debt", "IDFC_Due", "IDFC_HP",
+        "Super_Debt", "Super_Due", "Super_HP",
         "Risk_Points",
-        "Total_Payments", "Total_Expenses", "New_Income"
+        "Total_Paid_From_Savings", "Total_Balance_Transfers", "Total_New_Expenses"
     ]
     return pd.DataFrame(columns=columns)
 
@@ -88,390 +64,429 @@ def save_data():
     """Saves the session state history to CSV."""
     st.session_state.history.to_csv(HISTORY_FILE, index=False)
 
-def initialize_state():
+def initialize_state(setup_data):
     """
-    Initializes the game state.
-    Loads from CSV if it exists, otherwise sets defaults.
+    Initializes or resets the game state based on sidebar setup.
+    This function is called when the 'Start/Reset Game' button is pressed.
     """
-    if 'initialized' in st.session_state:
-        return
+    
+    # 1. Clear existing history file
+    if os.path.exists(HISTORY_FILE):
+        os.remove(HISTORY_FILE)
+        
+    # 2. Set game settings
+    st.session_state.min_payment_pct = setup_data['min_payment_pct']
+    st.session_state.high_debt_pct = setup_data['high_debt_pct']
+    
+    # 3. Initialize game state
+    st.session_state.month = 1
+    st.session_state.risk_points = 0
+    st.session_state.accounts = {
+        "Savings": {
+            "balance": setup_data['savings_balance'],
+            "hp": 100
+        },
+        "Kotak": {
+            "full_limit": setup_data['kotak_limit'],
+            "current_debt": setup_data['kotak_debt'],
+            "month_due": setup_data['kotak_due'],
+            "hp": 100
+        },
+        "IDFC": {
+            "full_limit": setup_data['idfc_limit'],
+            "current_debt": setup_data['idfc_debt'],
+            "month_due": setup_data['idfc_due'],
+            "hp": 100
+        },
+        "Super": {
+            "full_limit": setup_data['super_limit'],
+            "current_debt": setup_data['super_debt'],
+            "month_due": setup_data['super_due'],
+            "hp": 100
+        }
+    }
+    
+    # 4. Create first history entry (Month 0 / Start)
+    initial_entry = {
+        "Month": 0,
+        "Savings_Balance": setup_data['savings_balance'], "Savings_HP": 100,
+        "Kotak_Debt": setup_data['kotak_debt'], "Kotak_Due": setup_data['kotak_due'], "Kotak_HP": 100,
+        "IDFC_Debt": setup_data['idfc_debt'], "IDFC_Due": setup_data['idfc_due'], "IDFC_HP": 100,
+        "Super_Debt": setup_data['super_debt'], "Super_Due": setup_data['super_due'], "Super_HP": 100,
+        "Risk_Points": 0,
+        "Total_Paid_From_Savings": 0.0, "Total_Balance_Transfers": 0.0, "Total_New_Expenses": 0.0
+    }
+    st.session_state.history = pd.DataFrame([initial_entry])
+    save_data()
+    
+    st.session_state.game_started = True
+    st.success("Game Started! History has been reset.")
+
+
+def load_from_history():
+    """Loads the last known state from the CSV file."""
+    if 'game_started' in st.session_state:
+        return # Game is already running
 
     history_df = load_data()
-
-    if history_df.empty:
-        # Start a new game
-        st.session_state.month = 1
-        st.session_state.accounts = {
-            "Savings": 50000.0,
-            "Kotak": 0.0,
-            "IDFC": 0.0,
-            "Supermoney": 0.0
-        }
-        st.session_state.hp = {
-            "Savings": 100,
-            "Kotak": 100,
-            "IDFC": 100,
-            "Supermoney": 100
-        }
-        st.session_state.risk_points = 0
-        
-        # Save this initial state as Month 0 (start)
-        initial_entry = {
-            "Month": 0,
-            "Savings_Balance": 50000.0, "Kotak_Debt": 0.0, "IDFC_Debt": 0.0, "Supermoney_Debt": 0.0,
-            "Savings_HP": 100, "Kotak_HP": 100, "IDFC_HP": 100, "Supermoney_HP": 100,
-            "Risk_Points": 0,
-            "Total_Payments": 0.0, "Total_Expenses": 0.0, "New_Income": 50000.0
-        }
-        st.session_state.history = pd.DataFrame([initial_entry])
-        save_data()
-        
-    else:
-        # Load the last known state from history
-        st.session_state.history = history_df
+    if not history_df.empty:
         last_row = history_df.iloc[-1]
         
+        # Load settings (if they exist, otherwise use defaults)
+        st.session_state.min_payment_pct = st.sidebar.number_input("Min. Payment %", 1, 20, 5)
+        st.session_state.high_debt_pct = st.sidebar.number_input("High Debt % Threshold", 50, 100, 80)
+
         st.session_state.month = int(last_row["Month"]) + 1
-        st.session_state.accounts = {
-            "Savings": last_row["Savings_Balance"],
-            "Kotak": last_row["Kotak_Debt"],
-            "IDFC": last_row["IDFC_Debt"],
-            "Supermoney": last_row["Supermoney_Debt"]
-        }
-        st.session_state.hp = {
-            "Savings": int(last_row["Savings_HP"]),
-            "Kotak": int(last_row["Kotak_HP"]),
-            "IDFC": int(last_row["IDFC_HP"]),
-            "Supermoney": int(last_row["Supermoney_HP"])
-        }
         st.session_state.risk_points = int(last_row["Risk_Points"])
-
-    # Game settings (initialized every time, not saved in CSV for simplicity)
-    st.session_state.debt_high = st.sidebar.number_input(
-        "High Debt Threshold (₹)", value=15000, min_value=1, step=1000,
-        help="Debt above this amount will appear RED and cause high HP loss."
-    )
-    st.session_state.debt_medium = st.sidebar.number_input(
-        "Medium Debt Threshold (₹)", value=5000, min_value=1, step=500,
-        help="Debt above this amount will appear ORANGE and cause medium HP loss."
-    )
-    
-    st.session_state.initialized = True
-
-
-def update_hp_and_risk(payments, card_to_card_amount):
-    """Updates HP and Risk Points based on new balances and actions."""
-    
-    # Get settings
-    medium_threshold = st.session_state.debt_medium
-    high_threshold = st.session_state.debt_high
-
-    # 1. Update Risk Points
-    if card_to_card_amount > 0:
-        st.session_state.risk_points += 50 # Flat penalty
-        st.warning(f"Using credit to pay credit added 50 Risk Points! Total: {st.session_state.risk_points}")
-    else:
-        # Risk decay
-        st.session_state.risk_points = max(0, st.session_state.risk_points - 10)
-
-    # 2. Update HP for Savings
-    savings_balance = st.session_state.accounts["Savings"]
-    if savings_balance < medium_threshold:
-        st.session_state.hp["Savings"] -= 20
-        st.toast("Savings HP dropped! Balance is critically low.", icon="😥")
-    elif savings_balance < high_threshold:
-        st.session_state.hp["Savings"] -= 10
-    elif savings_balance > high_threshold * 2: # Bonus for high savings
-        st.session_state.hp["Savings"] += 10
-        st.toast("Savings HP increased! Great buffer!", icon="🎉")
-    
-    st.session_state.hp["Savings"] = max(0, min(100, st.session_state.hp["Savings"]))
-
-    # 3. Update HP for Debt Accounts
-    for card in DEBT_ACCOUNTS:
-        debt = st.session_state.accounts[card]
-        payment = payments.get(card, 0.0)
-
-        if debt > high_threshold:
-            st.session_state.hp[card] -= 25 # High debt penalty
-        elif debt > medium_threshold:
-            st.session_state.hp[card] -= 10 # Medium debt penalty
-        elif debt < 1.0: # Paid off!
-            st.session_state.hp[card] += 20 # Big bonus
-            if payment > 0: # Only if a payment was made this month
-                st.toast(f"{card} is paid off! HP +20!", icon="🥳")
-        elif payment > 0:
-             st.session_state.hp[card] += 5 # Small bonus for good behavior
+        st.session_state.accounts = {
+            "Savings": {
+                "balance": last_row["Savings_Balance"],
+                "hp": last_row["Savings_HP"]
+            },
+            "Kotak": {
+                "full_limit": st.session_state.get('kotak_full_limit', last_row["Kotak_Debt"] * 2), # Estimate if not set
+                "current_debt": last_row["Kotak_Debt"],
+                "month_due": last_row["Kotak_Due"],
+                "hp": last_row["Kotak_HP"]
+            },
+            "IDFC": {
+                "full_limit": st.session_state.get('idfc_full_limit', last_row["IDFC_Debt"] * 2),
+                "current_debt": last_row["IDFC_Debt"],
+                "month_due": last_row["IDFC_Due"],
+                "hp": last_row["IDFC_HP"]
+            },
+            "Super": {
+                "full_limit": st.session_state.get('super_full_limit', last_row["Super_Debt"] * 2),
+                "current_debt": last_row["Super_Debt"],
+                "month_due": last_row["Super_Due"],
+                "hp": last_row["Super_HP"]
+            }
+        }
         
-        # Clamp HP between 0 and 100
-        st.session_state.hp[card] = max(0, min(100, st.session_state.hp[card]))
+        # Need to store full limits in state to persist them
+        st.session_state.kotak_full_limit = st.session_state.accounts["Kotak"]["full_limit"]
+        st.session_state.idfc_full_limit = st.session_state.accounts["IDFC"]["full_limit"]
+        st.session_state.super_full_limit = st.session_state.accounts["Super"]["full_limit"]
 
+        st.session_state.history = history_df
+        st.session_state.game_started = True
+    
+
+def display_cc_card(col, name):
+    """Renders a single CC info card in a Streamlit column."""
+    acc = st.session_state.accounts[name]
+    
+    limit = acc['full_limit']
+    debt = acc['current_debt']
+    due = acc['month_due']
+    hp = acc['hp']
+    
+    available = limit - debt
+    usage_pct = (debt / limit) * 100 if limit > 0 else 0
+    color = get_utilization_color(usage_pct)
+    
+    with col:
+        st.subheader(f"💳 {name} CC")
+        st.metric(
+            label="Current Debt (₹)",
+            value=f"{debt:,.2f}",
+            delta=f"Full Limit: {limit:,.2f}",
+            delta_color="off"
+        )
+        st.metric(
+            label="Month Due (₹)",
+            value=f"{due:,.2f}",
+            delta=f"HP: {hp}",
+            delta_color=get_hp_color(hp)
+        )
+        st.metric(
+            label="Limit Available (₹)",
+            value=f"{available:,.2f}",
+            delta=f"{usage_pct:.1f}% Utilized",
+            delta_color="inverse" if usage_pct > st.session_state.high_debt_pct else "normal"
+        )
+        # Custom colored progress bar
+        st.markdown(f"""
+        <div style="background: #f0f2f6; border-radius: 5px; height: 10px; margin-top: -10px;">
+            <div style="width: {usage_pct}%; background-color: {color}; height: 10px; border-radius: 5px;"></div>
+        </div>
+        """, unsafe_allow_html=True)
 
 def process_month_end(inputs):
-    """
-    Main game logic. Takes user inputs, updates state, saves history.
-    """
+    """Main game logic to process the month-end form."""
     
-    # 1. Calculate totals
-    total_payment = inputs['pay_kotak'] + inputs['pay_idfc'] + inputs['pay_supermoney']
-    total_expense = inputs['exp_kotak'] + inputs['exp_idfc'] + inputs['exp_supermoney']
+    acc_state = st.session_state.accounts
     
-    # 2. Validate Payments
-    if total_payment > st.session_state.accounts["Savings"]:
-        st.error(f"Action Failed: Total payment (₹{total_payment:,.2f}) exceeds your savings (₹{st.session_state.accounts['Savings']:,.2f}).")
-        return # Stop processing
-    
-    # 3. Apply New Income
-    st.session_state.accounts["Savings"] += inputs['new_savings']
-    
-    # 4. Apply Payments from Savings
-    st.session_state.accounts["Savings"] -= total_payment
-    st.session_state.accounts["Kotak"] -= inputs['pay_kotak']
-    st.session_state.accounts["IDFC"] -= inputs['pay_idfc']
-    st.session_state.accounts["Supermoney"] -= inputs['pay_supermoney']
-    
-    # 5. Apply New Expenses (Increase Debt)
-    st.session_state.accounts["Kotak"] += inputs['exp_kotak']
-    st.session_state.accounts["IDFC"] += inputs['exp_idfc']
-    st.session_state.accounts["Supermoney"] += inputs['exp_supermoney']
-
-    # 6. Apply Card-to-Card (High Risk)
-    card_to_card_payment = inputs['pay_idfc_with_kotak']
-    if card_to_card_payment > 0:
-        # Validate this payment doesn't exceed debt
-        if card_to_card_payment > st.session_state.accounts["IDFC"]:
-            st.warning(f"Capping card-to-card payment to IDFC's current debt of ₹{st.session_state.accounts['IDFC']:,.2f}")
-            card_to_card_payment = st.session_state.accounts["IDFC"]
-            
-        st.session_state.accounts["IDFC"] -= card_to_card_payment
-        st.session_state.accounts["Kotak"] += card_to_card_payment # Increase Kotak's debt
-
-    # 7. Update HP and Risk
-    payments_dict = {
-        "Kotak": inputs['pay_kotak'],
-        "IDFC": inputs['pay_idfc'],
-        "Supermoney": inputs['pay_supermoney']
+    # Store original due amounts to check if they were paid
+    original_due = {
+        "Kotak": acc_state["Kotak"]["month_due"],
+        "IDFC": acc_state["IDFC"]["month_due"],
+        "Super": acc_state["Super"]["month_due"]
     }
-    update_hp_and_risk(payments_dict, card_to_card_payment)
+    
+    paid_this_month = { "Kotak": 0.0, "IDFC": 0.0, "Super": 0.0 }
+    total_paid_from_savings = 0.0
+    total_balance_transfers = 0.0
+    total_new_expenses = 0.0
+    
+    # --- 1. Add Income ---
+    acc_state["Savings"]["balance"] += inputs['new_income']
+    
+    # --- 2. Process Payments from Savings ---
+    total_from_savings = inputs['pay_kotak_sav'] + inputs['pay_idfc_sav'] + inputs['pay_super_sav']
+    if total_from_savings > acc_state["Savings"]["balance"]:
+        st.error(f"Action Failed: Total payment from savings (₹{total_from_savings:,.2f}) exceeds available savings (₹{acc_state['Savings']['balance']:,.2f}).")
+        return
+        
+    acc_state["Savings"]["balance"] -= total_from_savings
+    total_paid_from_savings = total_from_savings
+    
+    acc_state["Kotak"]["current_debt"] -= inputs['pay_kotak_sav']
+    paid_this_month["Kotak"] += inputs['pay_kotak_sav']
+    
+    acc_state["IDFC"]["current_debt"] -= inputs['pay_idfc_sav']
+    paid_this_month["IDFC"] += inputs['pay_idfc_sav']
+    
+    acc_state["Super"]["current_debt"] -= inputs['pay_super_sav']
+    paid_this_month["Super"] += inputs['pay_super_sav']
+    
+    # --- 3. Process Balance Transfers (High Risk!) ---
+    # We must process these one by one, checking available limit each time
+    
+    # Pay Kotak
+    for source_card in ["IDFC", "Super"]:
+        payment = inputs[f'pay_kotak_from_{source_card.lower()}']
+        if payment > 0:
+            source_acc = acc_state[source_card]
+            available = source_acc['full_limit'] - source_acc['current_debt']
+            if payment > available:
+                st.error(f"Failed: Payment from {source_card} (₹{payment:,.2f}) exceeds its available limit (₹{available:,.2f}).")
+                return
+            
+            source_acc['current_debt'] += payment # Increase source debt
+            acc_state["Kotak"]["current_debt"] -= payment # Decrease target debt
+            paid_this_month["Kotak"] += payment
+            total_balance_transfers += payment
+            st.session_state.risk_points += 25 # Penalty
 
-    # 8. Create new history entry
+    # Pay IDFC
+    for source_card in ["Kotak", "Super"]:
+        payment = inputs[f'pay_idfc_from_{source_card.lower()}']
+        if payment > 0:
+            source_acc = acc_state[source_card]
+            available = source_acc['full_limit'] - source_acc['current_debt']
+            if payment > available:
+                st.error(f"Failed: Payment from {source_card} (₹{payment:,.2f}) exceeds its available limit (₹{available:,.2f}).")
+                return
+            
+            source_acc['current_debt'] += payment
+            acc_state["IDFC"]["current_debt"] -= payment
+            paid_this_month["IDFC"] += payment
+            total_balance_transfers += payment
+            st.session_state.risk_points += 25
+
+    # Pay Super
+    for source_card in ["Kotak", "IDFC"]:
+        payment = inputs[f'pay_super_from_{source_card.lower()}']
+        if payment > 0:
+            source_acc = acc_state[source_card]
+            available = source_acc['full_limit'] - source_acc['current_debt']
+            if payment > available:
+                st.error(f"Failed: Payment from {source_card} (₹{payment:,.2f}) exceeds its available limit (₹{available:,.2f}).")
+                return
+            
+            source_acc['current_debt'] += payment
+            acc_state["Super"]["current_debt"] -= payment
+            paid_this_month["Super"] += payment
+            total_balance_transfers += payment
+            st.session_state.risk_points += 25
+            
+    if total_balance_transfers > 0:
+        st.warning(f"High Risk! You transferred ₹{total_balance_transfers:,.2f} between cards, gaining {st.session_state.risk_points} Risk Points!")
+
+    # --- 4. Process New Expenses ---
+    for card in CC_ACCOUNTS:
+        expense = inputs[f'exp_{card.lower()}']
+        if expense > 0:
+            acc = acc_state[card]
+            available = acc['full_limit'] - acc['current_debt']
+            if expense > available:
+                st.error(f"Failed: New expense on {card} (₹{expense:,.2f}) exceeds its available limit (₹{available:,.2f}).")
+                return
+            acc['current_debt'] += expense
+            total_new_expenses += expense
+
+    # --- 5. Update HP and Risk ---
+    
+    # Risk decay
+    st.session_state.risk_points = max(0, st.session_state.risk_points - 10)
+
+    # Savings HP
+    if acc_state["Savings"]["balance"] < 5000:
+        acc_state["Savings"]["hp"] = max(0, acc_state["Savings"]["hp"] - 20)
+    elif acc_state["Savings"]["balance"] > 100000:
+        acc_state["Savings"]["hp"] = min(100, acc_state["Savings"]["hp"] + 10)
+    else:
+        acc_state["Savings"]["hp"] = min(100, acc_state["Savings"]["hp"] + 2)
+
+    # CC HP
+    for card in CC_ACCOUNTS:
+        acc = acc_state[card]
+        
+        # Penalty for not paying the minimum
+        if paid_this_month[card] < original_due[card]:
+            acc['hp'] = max(0, acc['hp'] - 50)
+            st.toast(f"Critical! {card} minimum due was not paid! HP -50", icon="🔥")
+        else:
+            acc['hp'] = min(100, acc['hp'] + 10) # Bonus for paying due
+        
+        # Penalty for high utilization
+        usage_pct = (acc['current_debt'] / acc['full_limit']) * 100
+        if usage_pct > st.session_state.high_debt_pct:
+            acc['hp'] = max(0, acc['hp'] - 20)
+            st.toast(f"{card} utilization is over {st.session_state.high_debt_pct}%! HP -20", icon="😥")
+        
+        # Bonus for low utilization
+        if usage_pct < 10 and acc['current_debt'] > 0:
+            acc['hp'] = min(100, acc['hp'] + 5)
+            
+    # --- 6. Calculate Next Month's Due ---
+    min_pay_pct = st.session_state.min_payment_pct / 100.0
+    for card in CC_ACCOUNTS:
+        # Simplified: new due is a % of the new outstanding debt.
+        # A real game might add interest here too!
+        acc_state[card]["month_due"] = max(0, acc_state[card]["current_debt"] * min_pay_pct)
+
+    # --- 7. Save to History ---
     new_entry = {
         "Month": st.session_state.month,
-        "Savings_Balance": st.session_state.accounts["Savings"],
-        "Kotak_Debt": st.session_state.accounts["Kotak"],
-        "IDFC_Debt": st.session_state.accounts["IDFC"],
-        "Supermoney_Debt": st.session_state.accounts["Supermoney"],
-        "Savings_HP": st.session_state.hp["Savings"],
-        "Kotak_HP": st.session_state.hp["Kotak"],
-        "IDFC_HP": st.session_state.hp["IDFC"],
-        "Supermoney_HP": st.session_state.hp["Supermoney"],
+        "Savings_Balance": acc_state["Savings"]["balance"], "Savings_HP": acc_state["Savings"]["hp"],
+        "Kotak_Debt": acc_state["Kotak"]["current_debt"], "Kotak_Due": acc_state["Kotak"]["month_due"], "Kotak_HP": acc_state["Kotak"]["hp"],
+        "IDFC_Debt": acc_state["IDFC"]["current_debt"], "IDFC_Due": acc_state["IDFC"]["month_due"], "IDFC_HP": acc_state["IDFC"]["hp"],
+        "Super_Debt": acc_state["Super"]["current_debt"], "Super_Due": acc_state["Super"]["month_due"], "Super_HP": acc_state["Super"]["hp"],
         "Risk_Points": st.session_state.risk_points,
-        "Total_Payments": total_payment,
-        "Total_Expenses": total_expense,
-        "New_Income": inputs['new_savings']
+        "Total_Paid_From_Savings": total_paid_from_savings, 
+        "Total_Balance_Transfers": total_balance_transfers, 
+        "Total_New_Expenses": total_new_expenses
     }
     
-    # 9. Update session state history and save
     new_df = pd.DataFrame([new_entry])
     st.session_state.history = pd.concat([st.session_state.history, new_df], ignore_index=True)
     save_data()
     
-    # 10. Increment month
+    # --- 8. Increment Month and Rerun ---
     st.session_state.month += 1
-    
     st.success(f"Month {st.session_state.month - 1} processed! Welcome to Month {st.session_state.month}.")
     st.balloons()
-    
-    # Rerun to clear forms and show updated overview
     st.rerun()
 
+# ==================================================================
+#                        STREAMLIT UI
+# ==================================================================
 
-# --- Main Application UI ---
-
-st.set_page_config(layout="wide", page_title="Expense Management Game")
+st.set_page_config(layout="wide", page_title="CC Debt Management Game")
 
 # --- Sidebar ---
-st.sidebar.title("Game Controls")
+st.sidebar.title("Game Setup & Controls")
+st.sidebar.markdown("Set your initial financial state. Pressing 'Start' will **delete all history**.")
 
-# Initialize state (must happen before accessing state vars)
-initialize_state()
+with st.sidebar.expander("Game Settings"):
+    settings = {
+        'min_payment_pct': st.number_input("Min. Payment %", 1, 20, 5, 
+                                           help="The minimum % of debt that becomes 'Due' each month."),
+        'high_debt_pct': st.number_input("High Debt % Threshold", 50, 100, 80, 
+                                        help="Utilization % above this will appear RED and cause HP loss.")
+    }
 
-if st.sidebar.button("Reset Game (Deletes History)"):
-    if os.path.exists(HISTORY_FILE):
-        os.remove(HISTORY_FILE)
+with st.sidebar.form("setup_form"):
+    st.subheader("💰 Savings Account")
+    setup_inputs = {
+        'savings_balance': st.number_input("Current Savings Balance (₹)", 0.0, step=1000.0)
+    }
     
-    # Clear all session state keys
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
+    st.subheader("💳 Kotak CC")
+    setup_inputs['kotak_limit'] = st.number_input("Kotak: Full Limit (₹)", 1.0, step=1000.0)
+    setup_inputs['kotak_debt'] = st.number_input("Kotak: Current Debt (₹)", 0.0, step=100.0)
+    setup_inputs['kotak_due'] = st.number_input("Kotak: Month Due (₹)", 0.0, step=100.0)
     
-    st.sidebar.success("Game Reset! Reloading...")
+    st.subheader("💳 IDFC CC")
+    setup_inputs['idfc_limit'] = st.number_input("IDFC: Full Limit (₹)", 1.0, step=1000.0)
+    setup_inputs['idfc_debt'] = st.number_input("IDFC: Current Debt (₹)", 0.0, step=100.0)
+    setup_inputs['idfc_due'] = st.number_input("IDFC: Month Due (₹)", 0.0, step=100.0)
+    
+    st.subheader("💳 Super CC")
+    setup_inputs['super_limit'] = st.number_input("Super: Full Limit (₹)", 1.0, step=1000.0)
+    setup_inputs['super_debt'] = st.number_input("Super: Current Debt (₹)", 0.0, step=100.0)
+    setup_inputs['super_due'] = st.number_input("Super: Month Due (₹)", 0.0, step=100.0)
+    
+    # Add settings to setup data
+    setup_inputs.update(settings)
+    
+    submitted_setup = st.form_submit_button("Start / Reset Game")
+
+if submitted_setup:
+    # Store full limits in session state so they persist when loading
+    st.session_state.kotak_full_limit = setup_inputs['kotak_limit']
+    st.session_state.idfc_full_limit = setup_inputs['idfc_limit']
+    st.session_state.super_full_limit = setup_inputs['super_limit']
+    initialize_state(setup_inputs)
     st.rerun()
 
-st.sidebar.header("Game History")
-st.sidebar.dataframe(st.session_state.history.tail(10), use_container_width=True)
+# Try to load from history if game hasn't been started from sidebar
+if 'game_started' not in st.session_state:
+    load_from_history()
 
 
 # --- Main Page ---
 
-st.title("💸 Expense Management Game 💸")
-st.markdown(f"Welcome to **Month: {st.session_state.month}**. Manage your finances and keep your accounts healthy!")
-
-st.divider()
-
-# --- 1. Accounts Overview ---
-st.header("📊 Accounts Overview")
-
-cols = st.columns(4)
-display_account_card(cols[0], "Savings", st.session_state.accounts['Savings'], st.session_state.hp['Savings'], is_debt=False)
-display_account_card(cols[1], "Kotak", st.session_state.accounts['Kotak'], st.session_state.hp['Kotak'], is_debt=True)
-display_account_card(cols[2], "IDFC", st.session_state.accounts['IDFC'], st.session_state.hp['IDFC'], is_debt=True)
-display_account_card(cols[3], "Supermoney", st.session_state.accounts['Supermoney'], st.session_state.hp['Supermoney'], is_debt=True)
-
-# Risk Points Meter
-st.subheader("⚠️ Risk Level")
-risk_color = get_color_from_value(st.session_state.risk_points, high_is_bad=True, medium_threshold=50, high_threshold=100)
-st.markdown(f"**Risk Points:** <span style='font-size: 24px; color:{risk_color};'>{st.session_state.risk_points}</span>", unsafe_allow_html=True)
-st.progress(min(100, st.session_state.risk_points) / 100.0)
-if st.session_state.risk_points > 100:
-    st.error("DANGER! Your risk level is critical. Avoid using credit to pay credit at all costs!")
-elif st.session_state.risk_points > 50:
-    st.warning("High Risk! Using credit to pay other credit accounts is unsustainable.")
-
-st.divider()
-
-# --- 2. Monthly Actions ---
-st.header("🕹️ Monthly Actions")
-
-with st.form("monthly_actions_form"):
-    inputs = {}
-    
-    st.subheader("💰 Income")
-    inputs['new_savings'] = st.number_input(
-        "Add to Savings (e.g., Salary) (₹)", 
-        min_value=0.0, step=1000.0, value=25000.0,
-        help="Money earned this month."
-    )
-
-    st.divider()
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("💳 Payments from Savings")
-        st.caption(f"Max available: ₹{st.session_state.accounts['Savings'] + inputs['new_savings']:,.2f}")
-        
-        inputs['pay_kotak'] = st.number_input(
-            "Pay to Kotak (₹)", min_value=0.0, 
-            max_value=st.session_state.accounts['Kotak'], 
-            step=100.0,
-            help="Cannot pay more than you owe."
-        )
-        inputs['pay_idfc'] = st.number_input(
-            "Pay to IDFC (₹)", min_value=0.0, 
-            max_value=st.session_state.accounts['IDFC'], 
-            step=100.0
-        )
-        inputs['pay_supermoney'] = st.number_input(
-            "Pay to Supermoney (₹)", min_value=0.0, 
-            max_value=st.session_state.accounts['Supermoney'], 
-            step=100.0
-        )
-        
-        total_payment = inputs['pay_kotak'] + inputs['pay_idfc'] + inputs['pay_supermoney']
-        st.info(f"Total Payment: ₹{total_payment:,.2f}")
-
-    with col2:
-        st.subheader("💸 New Expenses")
-        st.caption("New debt incurred this month.")
-        
-        inputs['exp_kotak'] = st.number_input("New Expense on Kotak (₹)", min_value=0.0, step=100.0)
-        inputs['exp_idfc'] = st.number_input("New Expense on IDFC (₹)", min_value=0.0, step=100.0)
-        inputs['exp_supermoney'] = st.number_input("New Expense on Supermoney (₹)", min_value=0.0, step=100.0)
-        
-        total_expense = inputs['exp_kotak'] + inputs['exp_idfc'] + inputs['exp_supermoney']
-        st.info(f"Total New Expense: ₹{total_expense:,.2f}")
-
-    st.divider()
-    
-    st.subheader("🔄 Card-to-Card (High Risk!)")
-    inputs['pay_idfc_with_kotak'] = st.number_input(
-        f"Pay IDFC using Kotak (Max: ₹{st.session_state.accounts['IDFC']:,.2f})", 
-        min_value=0.0, 
-        max_value=st.session_state.accounts['IDFC'], 
-        step=100.0,
-        help="This will increase Kotak debt and add 50 Risk Points!"
-    )
-
-    submitted = st.form_submit_button(f"End Month {st.session_state.month} & Process Actions")
-
-if submitted:
-    process_month_end(inputs)
-
-
-st.divider()
-
-# --- 3. Visualization ---
-st.header("📈 Financial History")
-
-if len(st.session_state.history) < 2:
-    st.info("Play a few months to see your history charts.")
+if 'game_started' not in st.session_state:
+    st.title("💸 Welcome to the CC Debt Management Game 💸")
+    st.info("Please set up your accounts in the sidebar and press 'Start Game' to begin.")
 else:
-    history_df = st.session_state.history.copy()
+    st.title(f"💸 CC Debt Management: Month {st.session_state.month} 💸")
     
-    # Prepare data for plotting
-    balances_df = history_df.melt(
-        id_vars=['Month'], 
-        value_vars=['Savings_Balance', 'Kotak_Debt', 'IDFC_Debt', 'Supermoney_Debt'],
-        var_name='Account', 
-        value_name='Balance (₹)'
-    )
+    # --- 1. Accounts Overview ---
+    st.header("📊 Accounts Overview")
     
-    hp_df = history_df.melt(
-        id_vars=['Month'], 
-        value_vars=['Savings_HP', 'Kotak_HP', 'IDFC_HP', 'Supermoney_HP', 'Risk_Points'],
-        var_name='Metric', 
-        value_name='Points'
-    )
-    
-    flows_df = history_df.melt(
-        id_vars=['Month'],
-        value_vars=['Total_Payments', 'Total_Expenses', 'New_Income'],
-        var_name='Flow',
-        value_name='Amount (₹)'
-    )
+    cols = st.columns(4)
+    with cols[0]:
+        st.subheader("💰 Savings")
+        st.metric(
+            label="Current Balance (₹)",
+            value=f"{st.session_state.accounts['Savings']['balance']:,.2f}",
+            delta=f"HP: {st.session_state.accounts['Savings']['hp']}",
+            delta_color=get_hp_color(st.session_state.accounts['Savings']['hp'])
+        )
 
-    # Chart 1: Account Balances Over Time
-    st.subheader("Account Balances Over Time")
-    balance_chart = alt.Chart(balances_df).mark_line(point=True).encode(
-        x=alt.X('Month', axis=alt.Axis(format='d')), # Format as integer
-        y=alt.Y('Balance (₹)', title='Balance (₹)'),
-        color='Account',
-        tooltip=['Month', 'Account', 'Balance (₹)']
-    ).interactive()
-    st.altair_chart(balance_chart, use_container_width=True)
-    
-    # Chart 2: Monthly Flows (Payments vs Expenses)
-    st.subheader("Monthly Income vs. Payments vs. Expenses")
-    flow_chart = alt.Chart(flows_df).mark_bar().encode(
-        x=alt.X('Month:O', axis=alt.Axis(title='Month')), # Treat month as ordinal
-        y=alt.Y('Amount (₹)', title='Amount (₹)'),
-        color='Flow',
-        xOffset='Flow',
-        tooltip=['Month', 'Flow', 'Amount (₹)']
-    ).interactive()
-    st.altair_chart(flow_chart, use_container_width=True)
+    display_cc_card(cols[1], "Kotak")
+    display_cc_card(cols[2], "IDFC")
+    display_cc_card(cols[3], "Super")
 
-    # Chart 3: Health & Risk Over Time
-    st.subheader("Health & Risk Over Time")
-    hp_chart = alt.Chart(hp_df).mark_line(point=True).encode(
-        x=alt.X('Month', axis=alt.Axis(format='d')),
-        y=alt.Y('Points', title='Points (HP / Risk)'),
-        color='Metric',
-        tooltip=['Month', 'Metric', 'Points']
-    ).interactive()
-    st.altair_chart(hp_chart, use_container_width=True)
+    # Risk Points Meter
+    st.subheader("⚠️ Risk Level")
+    risk_color = "red" if st.session_state.risk_points > 100 else ("orange" if st.session_state.risk_points > 50 else "green")
+    st.markdown(f"**Risk Points:** <span style='font-size: 24px; color:{risk_color};'>{st.session_state.risk_points}</span>", unsafe_allow_html=True)
+    st.progress(min(100, st.session_state.risk_points) / 100.0)
+    if st.session_state.risk_points > 50:
+        st.warning("High Risk! Using credit to pay credit is unsustainable.")
 
-    # Show raw data history
-    with st.expander("View Raw History Data"):
-        st.dataframe(st.session_state.history, use_container_width=True)
+    st.divider()
 
+    # --- 2. Monthly Actions ---
+    st.header("🕹️ Monthly Actions")
+    with st.form("monthly_actions_form"):
+        form_inputs = {}
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("💰 Income & 💸 Expenses")
+            form_inputs['new_income'] = st.number_input("New Income to Savings (₹)", 0.0, step=1000.0)
+            st.divider()
+            form_inputs['exp_kotak'] = st.number_input("New Expense on Kotak (₹)", 0.0, step=100.0)
+            form_inputs['exp_idfc'] = st.number_input("New Expense on IDFC (₹)", 0.0, step=100.0)
+            form_inputs['exp_super'] = st.number_input("New Expense on Super (₹)", 0.0, step=100.0)
+            
+        with c2:
+            st.subheader("💳 Payments from Savings")
+            st.caption(f"Available: ₹{st.session_state.accounts['Savings']['balance'] + form_inputs['new_income']:,.2f}")
+            form_inputs['pay_kotak_sav'] = st.number_input("Pay Kotak from Savings (₹)", 0.0, step=10
